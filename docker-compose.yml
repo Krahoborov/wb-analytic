@@ -1,0 +1,38 @@
+services:
+  loader:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    command: python loader.py
+
+  loader2:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    command: python loader2.py
+
+  checker:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    command: python checker.py
+
+  bot:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"  # Пример порта (если нужно)
+    command: python bot.py
