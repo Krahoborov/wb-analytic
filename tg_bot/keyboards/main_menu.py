@@ -4,7 +4,7 @@ def main_menu_keyboard():
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         InlineKeyboardButton("Фин Отчёт", callback_data="an_1"),
-        InlineKeyboardButton("Товарная аналитика (Excel)", callback_data="product_analytics"),
+        InlineKeyboardButton("отчёт по товарам .xl", callback_data="start_analytics_report"),
         InlineKeyboardButton("Настройка магазина", callback_data="settings"),
         InlineKeyboardButton("Подписка", callback_data="subscription"),
         InlineKeyboardButton("PNL", callback_data="pnl"),
