@@ -137,7 +137,7 @@ async def tax_settings_callback(callback: types.CallbackQuery, state: FSMContext
 async def set_custom_tax_callback(callback: types.CallbackQuery, state: FSMContext):
     """Обработчик для ввода произвольного процента налога"""
     await callback.message.edit_text(
-        "�� <b>Введите процент налога</b>\n\n"
+        "<b>Введите процент налога</b>\n\n"
         "Напишите число от 0 до 100 (например: 15 для 15%):",
         reply_markup=InlineKeyboardMarkup().add(
             InlineKeyboardButton("🔙 Назад", callback_data="tax_settings")
@@ -149,6 +149,8 @@ async def process_tax_percent(message: types.Message, state: FSMContext):
     """Обработчик ввода процента налога"""
     try:
         tax_percent = float(message.text.strip())
+        print("Введенный custom_percent = ", tax_percent)  # ← ЗДЕСЬ
+        
         if 0 <= tax_percent <= 100:
             # Сохраняем в состояние
             async with state.proxy() as data:
@@ -188,11 +190,14 @@ async def set_tax_system_callback(callback: types.CallbackQuery, state: FSMConte
     tax_type = None
     if tax_type_value == "usn6":
         tax_type = TaxSystemType.USN_6
+        print("tax_type = ", tax_type)
     elif tax_type_value == "notax":
         tax_type = TaxSystemType.NO_TAX
+        print("tax_type = ", tax_type)
     elif tax_type_value == "custom":
         # Переходим к вводу процента
         await set_custom_tax_callback(callback, state)
+        print("custom_percent = ", custom_percent)
         return        
     else:
         await callback.answer("❌ Неизвестный тип налоговой системы")
