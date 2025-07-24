@@ -1,9 +1,12 @@
 from aiogram import types
+import asyncio
+from tg_bot.services.wb_api import fetch_report_detail_by_period
 from aiogram.dispatcher import FSMContext, Dispatcher
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from aiogram.utils.exceptions import MessageNotModified
 from tg_bot.models import (
     Order,
+    Shop,
     sessionmaker,
     engine,
     ProductCost,
@@ -33,6 +36,8 @@ import openpyxl
 import json
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
+from openpyxl import load_workbook
+
 
 logger = logging.getLogger(__name__)
 
@@ -674,9 +679,11 @@ async def process_price_and_cost(message: types.Message, state: FSMContext):
         await state.finish()
 
 
-async def product_analytics_callback(callback: types.CallbackQuery, state: FSMContext):
+async def product_analytics_callback(callback: types.CallbackQuery, state: FSMContext,start_date,end_date):
+    print("product_analytics_callback")
     async with state.proxy() as data:
         if "shop" not in data:
+            print("shop in data")
             await callback.answer("❌ Сначала выберите магазин", show_alert=True)
             return
 
@@ -695,7 +702,7 @@ async def product_analytics_callback(callback: types.CallbackQuery, state: FSMCo
 
     # Получаем данные и генерируем отчет
     try:
-        wb = await generate_product_analytics_report(api_token, shop_id)
+        wb = await generate_product_analytics_report(api_token, shop_id,start_date,end_date)
         if not wb:
             await message2.edit_text(
                 "❌ <b>Не удалось сгенерировать отчет</b>\n\n"
@@ -725,67 +732,86 @@ async def product_analytics_callback(callback: types.CallbackQuery, state: FSMCo
             "❌ Произошла ошибка при генерации отчета. Попробуйте позже."
         )
 
+#Вызывает календарь когда тригерится функция с эксель отчётом
+async def start_analytics_report(callback: types.CallbackQuery, state: FSMContext):
+    # Сохраняем, что после выбора периода нужно вызвать generate_product_analytics_report
+    await state.update_data(report_type="product_analytics")
+    await custom_period_callback(callback, state)  # Показываем выбор периода
 
-async def generate_product_analytics_report(api_token: str, shop_id: int):
+async def generate_product_analytics_report(api_token: str, shop_id: int, start_date, end_date):
     """Генерация Excel-отчета с товарной аналитикой"""
-    end_date = datetime.utcnow()
-    start_date = datetime(year=end_date.year, month=end_date.month, day=1)
-    star = datetime.today() - timedelta(days=datetime.today().isoweekday())
-    week_start = datetime(star.year, star.month, star.day + 1, 0, 0)
-
-    # Получаем отчет за последний месяц
+    # Получаем кэшированные данные
     session = sessionmaker(bind=engine)()
-    report = (
+    cashed_data = (
         session.query(CashedShopData)
         .filter(CashedShopData.shop_id == shop_id)
         .first()
-        .cashed_month
     )
-    session.close()
-    if not report:
+    
+    if not cashed_data or not cashed_data.cashed_all:
+        print("no cashed_data")
+        session.close()
+        return None
+
+    # Фильтруем данные по выбранному периоду
+    report_data = []
+    for item in cashed_data.cashed_all:
+        try:
+            sale_date = datetime.strptime(item.get("sale_dt", "")[:10], "%Y-%m-%d")
+            if start_date <= sale_date <= end_date:
+                report_data.append(item)
+        except (ValueError, TypeError):
+            continue
+
+    if not report_data:
+        print("no report_data")
+        session.close()
         return None
 
     # Создаем Excel-книгу
-    wb = openpyxl.Workbook()
+    try:
+        wb = load_workbook("template.xlsx")
+    except FileNotFoundError:
+        wb = openpyxl.Workbook()
+    
     ws = wb.active
     ws.title = "Товарная аналитика"
 
-    # Заголовки столбцов
     headers = [
-        "Наименование",
         "Артикул",
+        "Наименование",
+        "Выручка",
+        "Чистая прибыль с рекламой",
+        "Рентабельность продаж",
+        "Рентабельность CPM",
         "Заказы (шт)",
         "Продажи (шт)",
         "Возвраты (шт)",
-        "Отмены (шт)",
-        "Продажи (руб)",
         "Возвраты (руб)",
-        "Выручка",
-        "Итого продаж (шт)",
         "% выкупа",
         "Комиссия (руб)",
         "% комиссии",
         "Логистика (руб)",
-        # "Обратная логистика (руб)",
         "Логистика на ед",
         "% логистики",
         "Все удержания",
         "% удержаний",
-        "Налог",
-        "Прибыль без рекламы",
         "Реклама",
+        "Реклама % от выручки",
+        "Прибыль без рекламы",
         "Удержания",
-        "Чистая прибыль с рекламой",
-        "Рентабельность CPM",
+        "Налог",
     ]
 
     # Добавляем заголовки
     for col_num, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_num, value=header)
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill(
-            start_color="DDEBF7", end_color="DDEBF7", fill_type="solid"
-        )
+        #cell.font = Font(bold=True)
+        #cell.fill = PatternFill(
+        #    start_color="DDEBF7", end_color="DDEBF7", fill_type="solid"
+        #)
+
+    # Рассчитываем регулярные расходы за период
     regular_expenses = 0
     days_in_period = (end_date - start_date).days + 1
     for expense in session.query(RegularExpense).filter(
@@ -800,19 +826,15 @@ async def generate_product_analytics_report(api_token: str, shop_id: int):
 
     # Собираем данные по артикулам
     articles_data = {}
-    for item in report:
+    for item in report_data:  # Используем report_data вместо report
         article = item.get("sa_name")
-        # if not article:
-        #     continue
         if not article:
-
             if item.get("nm_id", 0):
-                print(item)
-                print(articles_data)
-                print("\n\n")
+                # Ищем артикул по nm_id
                 for article2, item2 in articles_data.items():
                     if item2.get("nm_id") == item.get("nm_id"):
                         article = article2
+                        break
         if not article:
             continue
 
@@ -828,7 +850,7 @@ async def generate_product_analytics_report(api_token: str, shop_id: int):
                 "commission": 0,
                 "logistics": 0,
                 "storage": 0,
-                "return_logistics": 0,  # Обратная логистика (пока нет данных)
+                "return_logistics": 0,
                 "nm_id": item.get("nm_id", 0),
                 "deduction": 0
             }
@@ -840,35 +862,31 @@ async def generate_product_analytics_report(api_token: str, shop_id: int):
 
         if "продажа" in doc_type.lower() or "sale" in doc_type.lower():
             articles_data[article]["sales"] += quantity
-            articles_data[article]["sales_rub"] += price*quantity
+            articles_data[article]["sales_rub"] += price * quantity
         elif "возврат" in doc_type.lower() or "return" in doc_type.lower():
             articles_data[article]["returns"] += quantity
             articles_data[article]["returns_rub"] += price
         elif "отмена" in doc_type.lower() or "cancellation" in doc_type.lower():
             articles_data[article]["cancellations"] += quantity
-        articles_data[article]["deduction"] += item['deduction']
-
+        
+        articles_data[article]["deduction"] += item.get('deduction', 0)
         articles_data[article]["commission"] += retail_price - item.get("ppvz_for_pay", 0)
         articles_data[article]["commission"] -= item.get("ppvz_reward", 0)
         articles_data[article]["commission"] -= item.get("ppvz_sales_commission", 0)
-
         articles_data[article]["logistics"] += item.get("delivery_rub", 0)
-        articles_data[article]["storage"] += item["storage_fee"]
-        # print(item["storage_fee"])
-
+        articles_data[article]["storage"] += item.get("storage_fee", 0)
         articles_data[article]["orders"] += quantity
 
-    print(week_start)
+    # Добавляем данные из заказов за период
     orders = (
         session.query(Order)
         .filter(Order.is_bouhght.is_(True))
-        .filter(Order.date >= week_start)
+        .filter(Order.date >= start_date)
+        .filter(Order.date <= end_date)
         .filter(Order.isCancel.is_(False))
         .filter(Order.shop_id == shop_id)
         .all()
     )
-    # for article, item in articles_data.items():
-    #     print(item.get("commission"))
 
     for order in orders:
         if order.supplierArticle not in articles_data:
@@ -891,50 +909,57 @@ async def generate_product_analytics_report(api_token: str, shop_id: int):
         articles_data[order.supplierArticle]["sales"] += 1
         articles_data[order.supplierArticle]["orders"] += 1
         articles_data[order.supplierArticle]["commission"] += order.priceWithDisc - order.forPay
+
     amount_articles = len(articles_data)
 
-    for item in report:
+    # Обрабатываем общие удержания и хранение
+    for item in report_data:  # Используем report_data вместо report
         if item.get("nm_id", 0) == 0:
             if item.get('bonus_type_name', '') == "Оказание услуг «ВБ.Продвижение»":
                 continue
             if item.get("ppvz_reward", 0):
-                for item2 in report:
+                for item2 in report_data:  # Используем report_data
                     if item2.get("srid") == item.get("srid"):
                         if item2.get("sa_name"):
                             articles_data[item2.get("sa_name")]["commission"] -= item.get("ppvz_reward")
                             break
-            deduction = item.get("deduction", 0)/amount_articles
-            storage = item.get("storage_fee", 0)/amount_articles
+            deduction = item.get("deduction", 0) / amount_articles if amount_articles > 0 else 0
+            storage = item.get("storage_fee", 0) / amount_articles if amount_articles > 0 else 0
             for article, data in articles_data.items():
                 data["deduction"] += deduction
                 data["storage"] += storage
 
-    regular_expenses_for_article = regular_expenses/amount_articles
-    session = sessionmaker()(bind=engine)
+    regular_expenses_for_article = regular_expenses / amount_articles if amount_articles > 0 else 0
+
+    # Получаем себестоимость товаров
     try:
         product_costs = (
             session.query(ProductCost).filter(ProductCost.shop_id == shop_id).all()
         )
-        # print(product_costs)
         cost_map = {pc.article: pc.cost for pc in product_costs}
-    finally:
-        session.close()
-    # print(cost_map, "\n\n|^ COST MAP")
-    # Налоговая ставка
-    session = sessionmaker()(bind=engine)
+    except Exception as e:
+        logger.error(f"Ошибка получения себестоимости: {e}")
+        cost_map = {}
+
+    # Получаем налоговую ставку
     try:
         tax_setting = (
             session.query(TaxSystemSetting)
             .filter(TaxSystemSetting.shop_id == shop_id)
             .first()
         )
-        tax_rate = (
-            0.06
-            if tax_setting and tax_setting.tax_system == TaxSystemType.USN_6
-            else 0.0
-        )
-    finally:
-        session.close()
+        if tax_setting:
+            if tax_setting.tax_system == TaxSystemType.USN_6:
+                tax_rate = 0.06
+            elif tax_setting.tax_system == TaxSystemType.NO_TAX:
+                tax_rate = 0.0
+            elif tax_setting.tax_system == TaxSystemType.CUSTOM:
+                tax_rate = tax_setting.custom_percent / 100 if tax_setting.custom_percent else 0.0
+            else:
+                tax_rate = 0.0
+    except Exception as e:
+        logger.error(f"Ошибка получения налоговых настроек: {e}")
+        tax_rate = 0.0
 
     # Заполняем данные в таблицу
     row_num = 2
@@ -951,9 +976,6 @@ async def generate_product_analytics_report(api_token: str, shop_id: int):
         logistics_per_unit = data["logistics"] / total_sales if total_sales else 0
         logistics_percent = (data["logistics"] / revenue) if revenue else 0
 
-        # Хранение
-        storage_percent = (data["storage"] / revenue) if revenue else 0
-
         # Удержания
         total_deductions = (
             data["commission"]
@@ -962,7 +984,6 @@ async def generate_product_analytics_report(api_token: str, shop_id: int):
             + data["storage"]
             + data["deduction"]
         )
-        # print(article, data["commission"], data["logistics"], data["return_logistics"], data["storage"], data["deduction"])
         deductions_percent = (total_deductions / revenue) if revenue else 0
 
         # Налог
@@ -976,71 +997,91 @@ async def generate_product_analytics_report(api_token: str, shop_id: int):
         profit_without_ads = (
             revenue - abs(total_cost) - abs(total_deductions) - abs(tax) - abs(regular_expenses_for_article)
         )
-        profit_with_ads = profit_without_ads  # Рекламные расходы не учитываем
-        adverisement = sum(
-            i.amount
-            for i in session.query(Advertisement)
-            .filter(Advertisement.nmId == int(data["nm_id"]))
-            .filter(Advertisement.date >= start_date)
-            .all()
-        )
-        # print(adverisement, int(data["nm_id"]), start_date, len(session.query(Advertisement).filter(Advertisement.nmId == int(data["nm_id"])).filter(Advertisement.date >= start_date).all()))
-        # data2r3 = session.query(Advertisement).filter(Advertisement.nmId == int(data["nm_id"])).filter(Advertisement.date >= start_date)
-        # print(data2r3)
-        penalty = sum(
-            i.sum
-            for i in session.query(Penalty)
-            .filter(Penalty.nm_id == data["nm_id"])
-            .filter(Penalty.date >= datetime.now() - timedelta(days=30))
-            .all()
-        )
-        # print((data["nm_id"]), adverisement, penalty)
+
+        # Рекламные расходы за период
+        try:
+            advertisement = sum(
+                i.amount
+                for i in session.query(Advertisement)
+                .filter(Advertisement.nmId == int(data["nm_id"]))
+                .filter(Advertisement.date >= start_date)
+                .filter(Advertisement.date <= end_date)
+                .all()
+            )
+        except Exception as e:
+            logger.error(f"Ошибка получения рекламных расходов: {e}")
+            advertisement = 0
+
+        # Штрафы за период
+        try:
+            penalty = sum(
+                i.sum
+                for i in session.query(Penalty)
+                .filter(Penalty.nm_id == data["nm_id"])
+                .filter(Penalty.date >= start_date)
+                .filter(Penalty.date <= end_date)
+                .all()
+            )
+        except Exception as e:
+            logger.error(f"Ошибка получения штрафов: {e}")
+            penalty = 0
+
         profit_with_ads = (
             revenue
             - abs(total_cost)
             - abs(total_deductions)
             - abs(tax)
-            - abs(adverisement)
+            - abs(advertisement)
             - abs(penalty)
             - abs(regular_expenses_for_article)
         )
+
         # Рентабельность
         profitability_cpm = (profit_without_ads / total_cost) * 100 if total_cost else 0
+        profitability_sales = (profit_with_ads / revenue) * 100 if revenue else 0
 
         # Заполняем строку
-        ws.cell(row=row_num, column=1, value=data["subject_name"])
-        ws.cell(row=row_num, column=2, value=article)
-        ws.cell(row=row_num, column=3, value=abs(data["orders"]))
-        ws.cell(row=row_num, column=4, value=abs(data["sales"]))
-        ws.cell(row=row_num, column=5, value=abs(data["returns"]))
-        ws.cell(row=row_num, column=6, value=abs(data["cancellations"]))
-        ws.cell(row=row_num, column=7, value=abs(data["sales_rub"]))
-        ws.cell(row=row_num, column=8, value=abs(data["returns_rub"]))
-        ws.cell(row=row_num, column=9, value=abs(revenue))
-        ws.cell(row=row_num, column=10, value=abs(total_sales))
+        ws.cell(row=row_num, column=1, value=article)
+        ws.cell(row=row_num, column=2, value=data["subject_name"])
+        ws.cell(row=row_num, column=3, value=abs(revenue))
+        ws.cell(row=row_num, column=4, value=profit_with_ads)
+        ws.cell(row=row_num, column=5, value=profitability_sales)
+        ws.cell(row=row_num, column=6, value=profitability_cpm)
+        ws.cell(row=row_num, column=7, value=abs(data["orders"]))
+        ws.cell(row=row_num, column=8, value=abs(data["sales"]))
+        ws.cell(row=row_num, column=9, value=abs(data["returns"]))
+        ws.cell(row=row_num, column=10, value=abs(data["returns_rub"]))
         ws.cell(row=row_num, column=11, value=abs(buyout_rate))
         ws.cell(row=row_num, column=12, value=data["commission"])
         ws.cell(row=row_num, column=13, value=abs(commission_percent))
-        ws.cell(row=row_num, column=14, value=abs(data["logistics"]+data["return_logistics"]))
-        # ws.cell(row=row_num, column=15, value=abs())
+        ws.cell(row=row_num, column=14, value=abs(data["logistics"]))
         ws.cell(row=row_num, column=15, value=abs(logistics_per_unit))
         ws.cell(row=row_num, column=16, value=abs(logistics_percent))
         ws.cell(row=row_num, column=17, value=abs(total_deductions))
         ws.cell(row=row_num, column=18, value=abs(deductions_percent))
-        ws.cell(row=row_num, column=19, value=abs(tax))
-        ws.cell(row=row_num, column=20, value=int(profit_without_ads))
-        ws.cell(row=row_num, column=21, value=adverisement)
+        ws.cell(row=row_num, column=19, value=advertisement)
+        ws.cell(row=row_num, column=20, value=(advertisement / revenue * 100) if revenue else 0)
+        ws.cell(row=row_num, column=21, value=profit_without_ads)
         ws.cell(row=row_num, column=22, value=data["deduction"])
-        ws.cell(row=row_num, column=23, value=profit_with_ads)
-        ws.cell(row=row_num, column=24, value=profitability_cpm)
+        ws.cell(row=row_num, column=23, value=abs(tax))
 
         row_num += 1
 
+
+        # Итоговая строка
+    last_row = ws.max_row + 1
+    ws.cell(row=last_row, column=1, value="ИТОГО")
+    for col in range(3, 24):  # Начиная с колонки "Заказы (шт)" до "Рентабельность CPM"
+        col_letter = get_column_letter(col)
+        if col in [5, 6, 11, 13, 16, 18, 20, 24]:  # Столбцы для средних значений
+            ws.cell(row=last_row, column=col, value=f"=AVERAGE({col_letter}2:{col_letter}{last_row - 1})")
+        else:  # Сумма по остальным столбцам
+            ws.cell(row=last_row, column=col, value=f"=SUM({col_letter}2:{col_letter}{last_row - 1})")
     # Форматирование
     apply_excel_formatting(ws)
-
+    
+    session.close()
     return wb
-
 
 def apply_excel_formatting(ws):
     """Применяет форматирование к Excel-листу"""
@@ -1064,7 +1105,7 @@ def apply_excel_formatting(ws):
         for cell in row:
             if isinstance(cell.value, (int, float)):
                 # Проценты
-                if cell.column_letter in ["K", "M", "P", "R"]:
+                if cell.column_letter in ["E", "K", "M", "P", "T"]:
                     cell.number_format = "0.00%"
                 elif (
                     cell.column >= 7
@@ -1228,11 +1269,18 @@ async def calculate_metrics_from_report(report_data, shop_id, start_date, end_da
 
         # TAX RATE TAX RATE TAX RATE
 
-        tax_rate = (
-            0.06
-            if tax_setting and tax_setting.tax_system == TaxSystemType.USN_6
-            else 0.0
-        )
+        # Стало:
+        if tax_setting:
+            if tax_setting.tax_system == TaxSystemType.USN_6:
+                tax_rate = 0.06
+            elif tax_setting.tax_system == TaxSystemType.NO_TAX:
+                tax_rate = 0.0
+            elif tax_setting.tax_system == TaxSystemType.CUSTOM:
+                tax_rate = tax_setting.custom_percent / 100 if tax_setting.custom_percent else 0.0
+            else:
+                tax_rate = 0.0
+        else:
+            tax_rate = 0.0
         tax = revenue * tax_rate
 
         # Регулярные затраты за период
@@ -1389,7 +1437,10 @@ async def calculate_metrics_from_report(report_data, shop_id, start_date, end_da
 
 async def select_anal_period_callback(callback: types.CallbackQuery, state: FSMContext):
 
-    
+
+
+
+
     period_type = callback.data.split("_")[1]  # day, week, month, year, custom
     await callback.message.delete()
     message = await callback.message.answer(
@@ -1454,16 +1505,29 @@ async def select_anal_period_callback(callback: types.CallbackQuery, state: FSMC
         session = sessionmaker(bind=engine)()
         cashed = session.query(CashedShopData).filter(CashedShopData.shop_id == shop_id).first()
 
+
+
+
     # Фильтруем отчет по периоду
-    if period_type == "custom" or period_type.startswith("custom_"):
-        current_report = []
-        for item in cashed.cashed_all or []:
-            try:
-                sale_date = datetime.strptime(item.get("sale_dt", "")[:10], "%Y-%m-%d")
-                if current_start <= sale_date <= current_end:
-                    current_report.append(item)
-            except Exception:
-                continue
+    #if period_type == "custom" or period_type.startswith("custom_"):
+    #    current_report = []
+    #    for item in cashed.cashed_all or []:
+    #        try:
+    #            sale_date = datetime.strptime(item.get("sale_dt", "")[:10], "%Y-%m-%d")
+    #            if current_start <= sale_date <= current_end:
+    #                current_report.append(item)
+    #        except Exception:
+    #            continue
+    #if period_type == "custom" or period_type.startswith("custom_"):
+    if True:
+        loop = asyncio.get_event_loop()
+        current_report = await loop.run_in_executor(
+            None,
+            fetch_report_detail_by_period,
+            api_token,
+            current_start,
+            current_end
+        )
     else:
         if period_type == "week":
             current_report = cashed.cashed_week or []
@@ -1695,6 +1759,7 @@ async def select_anal_period_callback(callback: types.CallbackQuery, state: FSMC
     # kb.add(InlineKeyboardButton("ROI(Рентабельность вложений)", callback_data="an_4"))
 
 
+
 async def anal_callback(callback: types.CallbackQuery, state: FSMContext):
     # Проверяем выбран ли магазин
 
@@ -1747,7 +1812,7 @@ async def custom_period_callback(callback: types.CallbackQuery, state: FSMContex
     )
     
     try:
-        await callback.message.edit_text(
+        await callback.message.answer(
             " <b>Выберите размер периода для расчета</b>\n\n"
             "Укажите, за какой период вы хотите получить данные:",
             reply_markup=keyboard
@@ -1856,15 +1921,16 @@ async def show_date_confirmation(callback: types.CallbackQuery, state: FSMContex
         print(f"Error in show_date_confirmation: {e}")
         await callback.answer()
 
+
 async def confirm_custom_callback(callback: types.CallbackQuery, state: FSMContext):
     """Обработчик подтверждения кастомного периода"""
     parts = callback.data.split("_")
     period_size = parts[2]  # day, week, month
-    
     async with state.proxy() as data:
         start_date = data["custom_start_date"]
         end_date = data["custom_end_date"]
         an_type = data["an_type"]
+        report_type = data.get("report_type")  # По умолчанию product_analytics
     
     # Создаем фейковый callback для select_anal_period_callback
     callback.data = f"anperiod_custom_{period_size}_{an_type.split('_')[1]}"
@@ -1874,9 +1940,15 @@ async def confirm_custom_callback(callback: types.CallbackQuery, state: FSMConte
         data["custom_period"] = True
         data["custom_start_date"] = start_date
         data["custom_end_date"] = end_date
-    
+    print("report_type", report_type)
+
+    shop_id = data["shop"]["id"]
+    api_token = data["shop"]["api_token"]
     # Вызываем основную функцию расчета
-    await select_anal_period_callback(callback, state)    
+    if report_type == "product_analytics":
+        await product_analytics_callback(callback, state, start_date, end_date)
+    else:
+        await select_anal_period_callback(callback, state)    
 
 async def calendar_navigation_callback(callback: types.CallbackQuery, state: FSMContext):
     print(f"calendar_navigation_callback triggered: {callback.data}")
@@ -1995,6 +2067,12 @@ async def ignore_callback(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()    
 
 def register_analytics_handlers(dp: Dispatcher):
+    #Обработчик под календарь на эксель отчёт
+    dp.register_callback_query_handler(
+        start_analytics_report, 
+        lambda c: c.data == "start_analytics_report", 
+        state="*"
+    )
     dp.register_callback_query_handler(analytics_callback, text="analytics", state="*")
     dp.register_callback_query_handler(
         profitability_estimation_callback, text="profitability_estimation", state="*"
@@ -2080,3 +2158,4 @@ def register_analytics_handlers(dp: Dispatcher):
     dp.register_callback_query_handler(
         back_to_analytics, text="back_to_analytics", state="*"
     )
+
